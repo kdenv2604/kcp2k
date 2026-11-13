@@ -83,6 +83,7 @@ namespace kcp2k
 
         // output function of type <buffer, size>
         readonly Action<byte[], int> output;
+        readonly bool pacedDataOutput;
 
         // segment pool to avoid allocations in C#.
         // this is not part of the original C code.
@@ -99,9 +100,13 @@ namespace kcp2k
         // create a new kcp control object, 'conv' must equal in two endpoint
         // from the same connection.
         public Kcp(uint conv, Action<byte[], int> output)
+            : this(conv, output, pacedDataOutput: false) {}
+
+        public Kcp(uint conv, Action<byte[], int> output, bool pacedDataOutput)
         {
             this.conv   = conv;
             this.output = output;
+            this.pacedDataOutput = pacedDataOutput;
             snd_wnd = WND_SND;
             rcv_wnd = WND_RCV;
             rmt_wnd = WND_RCV;
@@ -715,6 +720,98 @@ namespace kcp2k
             }
         }
 
+        enum Transmission { None, Initial, Timeout, Fast }
+
+        Transmission GetTransmission(Segment segment, uint now, uint resent)
+        {
+            if (segment.xmit == 0)
+                return Transmission.Initial;
+            if (Utils.TimeDiff(now, segment.resendts) >= 0)
+                return Transmission.Timeout;
+            return segment.fastack >= resent && (segment.xmit <= fastlimit || fastlimit <= 0)
+                ? Transmission.Fast : Transmission.None;
+        }
+
+        void RecordTransmission(Segment segment, Transmission transmission, uint now)
+        {
+            segment.xmit++;
+            switch (transmission)
+            {
+                case Transmission.Initial:
+                    segment.rto = rx_rto;
+                    segment.resendts = now + (uint)segment.rto + (nodelay == 0 ? (uint)rx_rto >> 3 : 0);
+                    break;
+                case Transmission.Timeout:
+                    xmit++;
+                    if (nodelay == 0)
+                        segment.rto += Math.Max(segment.rto, rx_rto);
+                    else
+                        segment.rto += (nodelay < 2 ? segment.rto : rx_rto) / 2;
+                    segment.resendts = now + (uint)segment.rto;
+                    break;
+                case Transmission.Fast:
+                    segment.fastack = 0;
+                    segment.resendts = now + (uint)segment.rto;
+                    break;
+            }
+            if (segment.xmit >= dead_link)
+                state = -1;
+        }
+
+        int EncodeData(Segment segment, int offset, uint now, uint window)
+        {
+            segment.ts = now;
+            segment.wnd = window;
+            segment.una = rcv_nxt;
+            int size = segment.Encode(buffer, offset);
+            int dataLength = (int)segment.data.Position;
+            Buffer.BlockCopy(segment.data.GetBuffer(), 0, buffer, offset + size, dataLength);
+            return size + dataLength;
+        }
+
+        uint SendWindow() => nocwnd ? Math.Min(snd_wnd, rmt_wnd) : Math.Min(cwnd, Math.Min(snd_wnd, rmt_wnd));
+        uint FastResendThreshold() => fastresend > 0 ? (uint)fastresend : uint.MaxValue;
+
+        internal int InputAt(byte[] data, int offset, int size, uint now)
+        {
+            current = now;
+            return Input(data, offset, size);
+        }
+
+        internal bool HasPacedData(uint now)
+        {
+            uint resent = FastResendThreshold();
+            foreach (Segment segment in snd_buf)
+                if (GetTransmission(segment, now, resent) != Transmission.None)
+                    return true;
+            return false;
+        }
+
+        // A paced socket owns no copy of the transmit queue. ACKs remove a
+        // segment here, even if a retry became due while the socket was busy.
+        internal bool TrySendPacedData(uint now, Func<byte[], int, bool> send)
+        {
+            uint resent = FastResendThreshold();
+            foreach (Segment segment in snd_buf)
+            {
+                Transmission transmission = GetTransmission(segment, now, resent);
+                if (transmission == Transmission.None)
+                    continue;
+                uint previousTimestamp = segment.ts;
+                int size = EncodeData(segment, 0, now, WndUnused());
+                if (!send(buffer, size))
+                {
+                    segment.ts = previousTimestamp;
+                    return false;
+                }
+                RecordTransmission(segment, transmission, now);
+                ApplyCongestionFeedback(transmission == Transmission.Fast, transmission == Transmission.Timeout,
+                    SendWindow(), resent);
+                return true;
+            }
+            return false;
+        }
+
         // ikcp_flush
         // flush remain ack segments.
         // flush may output multiple <= MTU messages from MakeSpace / FlushBuffer.
@@ -724,7 +821,6 @@ namespace kcp2k
         public void Flush()
         {
             int size  = 0;     // amount of bytes to flush. 'buffer ptr' in C.
-            bool lost = false; // lost segments
 
             // update needs to be called before flushing
             if (!updated) return;
@@ -800,15 +896,7 @@ namespace kcp2k
             // calculate the window size which is currently safe to send.
             // it's send window, or remote window, whatever is smaller.
             // for our max
-            uint cwnd_ = Math.Min(snd_wnd, rmt_wnd);
-
-            // double negative: if congestion window is enabled:
-            // limit window size to cwnd.
-            //
-            // note this may heavily limit window sizes.
-            // for our max message size test with super large windows of 32k,
-            // 'congestion window' limits it down from 32.000 to 2.
-            if (!nocwnd) cwnd_ = Math.Min(cwnd, cwnd_);
+            uint cwnd_ = SendWindow();
 
             // move cwnd_ 'window size' messages from snd_queue to snd_buf
             //   'snd_nxt' is what we want to send.
@@ -835,79 +923,21 @@ namespace kcp2k
             }
 
             // calculate resent
-            uint resent = fastresend > 0 ? (uint)fastresend : 0xffffffff;
-            uint rtomin = nodelay == 0 ? (uint)rx_rto >> 3 : 0;
-
-            // flush data segments
-            int change = 0;
-            foreach (Segment segment in snd_buf)
-            {
-                bool needsend = false;
-
-                // initial transmit
-                if (segment.xmit == 0)
+            uint resent = FastResendThreshold();
+            bool changed = false;
+            bool lost = false;
+            if (!pacedDataOutput)
+                foreach (Segment segment in snd_buf)
                 {
-                    needsend = true;
-                    segment.xmit++;
-                    segment.rto = rx_rto;
-                    segment.resendts = current + (uint)segment.rto + rtomin;
+                    Transmission transmission = GetTransmission(segment, current, resent);
+                    if (transmission == Transmission.None)
+                        continue;
+                    RecordTransmission(segment, transmission, current);
+                    changed |= transmission == Transmission.Fast;
+                    lost |= transmission == Transmission.Timeout;
+                    MakeSpace(ref size, OVERHEAD + (int)segment.data.Position);
+                    size += EncodeData(segment, size, current, seg.wnd);
                 }
-                // RTO
-                else if (Utils.TimeDiff(current, segment.resendts) >= 0)
-                {
-                    needsend = true;
-                    segment.xmit++;
-                    xmit++;
-                    if (nodelay == 0)
-                    {
-                        segment.rto += Math.Max(segment.rto, rx_rto);
-                    }
-                    else
-                    {
-                        int step = (nodelay < 2) ? segment.rto : rx_rto;
-                        segment.rto += step / 2;
-                    }
-                    segment.resendts = current + (uint)segment.rto;
-                    lost = true;
-                }
-                // fast retransmit
-                else if (segment.fastack >= resent)
-                {
-                    if (segment.xmit <= fastlimit || fastlimit <= 0)
-                    {
-                        needsend = true;
-                        segment.xmit++;
-                        segment.fastack = 0;
-                        segment.resendts = current + (uint)segment.rto;
-                        change++;
-                    }
-                }
-
-                if (needsend)
-                {
-                    segment.ts = current;
-                    segment.wnd = seg.wnd;
-                    segment.una = rcv_nxt;
-
-                    int need = OVERHEAD + (int)segment.data.Position;
-                    MakeSpace(ref size, need);
-
-                    size += segment.Encode(buffer, size);
-
-                    if (segment.data.Position > 0)
-                    {
-                        Buffer.BlockCopy(segment.data.GetBuffer(), 0, buffer, size, (int)segment.data.Position);
-                        size += (int)segment.data.Position;
-                    }
-
-                    // dead link happens if a message was resent N times, but an
-                    // ack was still not received.
-                    if (segment.xmit >= dead_link)
-                    {
-                        state = -1;
-                    }
-                }
-            }
 
             // kcp stackallocs 'seg'. our C# segment is a class though, so we
             // need to properly delete and return it to the pool now that we are
@@ -917,9 +947,14 @@ namespace kcp2k
             // flush remaining segments
             FlushBuffer(size);
 
+            ApplyCongestionFeedback(changed, lost, cwnd_, resent);
+        }
+
+        void ApplyCongestionFeedback(bool changed, bool lost, uint sendWindow, uint resent)
+        {
             // update ssthresh
             // rate halving, https://tools.ietf.org/html/rfc6937
-            if (change > 0)
+            if (changed)
             {
                 uint inflight = snd_nxt - snd_una;
                 ssthresh = inflight / 2;
@@ -933,7 +968,7 @@ namespace kcp2k
             if (lost)
             {
                 // original C uses 'cwnd', not kcp->cwnd!
-                ssthresh = cwnd_ / 2;
+                ssthresh = sendWindow / 2;
                 if (ssthresh < THRESH_MIN)
                     ssthresh = THRESH_MIN;
                 cwnd = 1;
